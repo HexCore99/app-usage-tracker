@@ -18,6 +18,24 @@ struct Application {
     executable: String,
     pid: u32,
 }
+struct AppUsage {
+    executable: String,
+    total_time: Duration,
+}
+
+fn update_usage(tracker: &mut HashMap<String, AppUsage>, app: &Application) {
+    if let Some(usage) = tracker.get_mut(&app.executable) {
+        usage.total_time += Duration::from_secs(1);
+    } else {
+        tracker.insert(
+            app.executable.clone(),
+            AppUsage {
+                executable: app.executable.clone(),
+                total_time: Duration::from_secs(1),
+            },
+        );
+    }
+}
 
 fn is_windows_system_path(executable: &str) -> bool {
     let Some(windows_directory) = std::env::var_os("WINDIR") else {
@@ -199,6 +217,7 @@ fn main() {
     let applications = list_applications();
     println!("{applications:#?}");
 
+    let mut usage_tracker: HashMap<String, AppUsage> = HashMap::new();
     loop {
         unsafe {
             // get the process
@@ -224,7 +243,17 @@ fn main() {
                 executable,
                 pid: process_id,
             };
+            if is_valid_application(&application) {
+                update_usage(&mut usage_tracker, &application);
 
+                if let Some(usage) = usage_tracker.get(&application.executable) {
+                    println!(
+                        "{}: {} seconds",
+                        usage.executable,
+                        usage.total_time.as_secs()
+                    );
+                }
+            }
             if application.executable != previous_process {
                 println!("-------------------------");
                 println!("Window: {}", application.title);
@@ -238,7 +267,7 @@ fn main() {
             if thread_id == 0 {
                 println!("Faile to get the process ID");
             }
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(Duration::from_secs(1));
         }
     }
 }
