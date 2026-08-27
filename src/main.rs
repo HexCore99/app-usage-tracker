@@ -1,92 +1,169 @@
+use std::collections::HashMap;
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
+use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
 };
 use windows::core::PWSTR;
 
-struct Process {
+#[derive(Debug)]
+struct Application {
     title: String,
     executable: String,
     pid: u32,
-    // process_handle: HANDLE,
 }
-struct RunningProcess {
-    pid: u32,
-    executable: String,
+
+fn is_windows_system_path(executable: &str) -> bool {
+    let Some(windows_directory) = std::env::var_os("WINDIR") else {
+        return false;
+    };
+
+    let windows_directory = windows_directory
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase();
+    let executable = executable.replace('/', "\\").to_lowercase();
+
+    executable.starts_with(&format!("{windows_directory}\\"))
 }
-fn is_user_app(process_name: &str) -> bool {
-    let ignored = [
-        "svchost.exe",
-        "System",
-        "Registry",
-        "csrss.exe",
-        "wininit.exe",
-        "services.exe",
-        "lsass.exe",
-        "dwm.exe",
-        "fontdrvhost.exe",
-        "RuntimeBroker.exe",
+
+fn is_valid_application(app: &Application) -> bool {
+    let title = app.title.trim().to_lowercase();
+
+    let executable_name = Path::new(&app.executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if title.is_empty() || executable_name.is_empty() {
+        return false;
+    }
+
+    // Explicit overrides belong at the top so a user choice wins over heuristics.
+    const ALLOWED_EXECUTABLES: &[&str] = &[];
+    const BLOCKED_EXECUTABLES: &[&str] = &[];
+
+    if ALLOWED_EXECUTABLES.contains(&executable_name.as_str()) {
+        return true;
+    }
+
+    if BLOCKED_EXECUTABLES.contains(&executable_name.as_str()) {
+        return false;
+    }
+
+    const BLOCKED_TITLES: &[&str] = &[
+        "program manager",
+        "windows input experience",
+        "nvidia geforce overlay",
+        "powertoys quick access (preview)",
+        "settings",
     ];
 
-    !ignored.contains(&process_name)
+    if BLOCKED_TITLES.contains(&title.as_str()) {
+        return false;
+    }
+
+    const HELPER_TITLE_MARKERS: &[&str] =
+        &["gracefulshutdownwindow", "uiaccesshelperwindow", "crashpad"];
+
+    if HELPER_TITLE_MARKERS
+        .iter()
+        .any(|marker| title.contains(marker))
+    {
+        return false;
+    }
+
+    const HELPER_EXECUTABLES: &[&str] = &["crashpad_handler.exe", "squirrel.exe", "update.exe"];
+
+    if HELPER_EXECUTABLES.contains(&executable_name.as_str()) {
+        return false;
+    }
+
+    const WINDOWS_SYSTEM_COMPONENTS: &[&str] = &[
+        "lockapp.exe",
+        "searchhost.exe",
+        "shellexperiencehost.exe",
+        "startmenuexperiencehost.exe",
+        "systemsettings.exe",
+        "textinputhost.exe",
+    ];
+
+    if is_windows_system_path(&app.executable)
+        && WINDOWS_SYSTEM_COMPONENTS.contains(&executable_name.as_str())
+    {
+        return false;
+    }
+
+    true
 }
 
-fn list_running_processes() -> Vec<RunningProcess> {
+unsafe extern "system" fn collect_application(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
-        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                println!("Failed to create process snapshot: {}", error);
-                return Vec::new();
-            }
+        let applications_ptr = lparam.0 as *mut HashMap<u32, Application>;
+        let applications = &mut *applications_ptr;
+
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+
+        let mut buffer = [0u16; 512];
+        let length = GetWindowTextW(hwnd, &mut buffer);
+
+        if length == 0 {
+            return BOOL(1);
+        }
+
+        let title = String::from_utf16_lossy(&buffer[..length as usize]);
+
+        let mut pid = 0u32;
+        if GetWindowThreadProcessId(hwnd, Some(&mut pid)) == 0 {
+            return BOOL(1);
+        }
+
+        let executable = match get_executable_path(pid) {
+            Ok(path) => path,
+            Err(_) => return BOOL(1),
         };
 
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
+        let application = Application {
+            title,
+            executable,
+            pid,
         };
 
-        if let Err(error) = Process32FirstW(snapshot, &mut entry) {
-            println!("Failed to read first process: {}", error);
-            let _ = CloseHandle(snapshot);
-            return Vec::new();
+        if !is_valid_application(&application) {
+            return BOOL(1);
         }
-        let mut processes = Vec::new();
 
-        loop {
-            let length = entry
-                .szExeFile
-                .iter()
-                .position(|&character| character == 0)
-                .unwrap_or(entry.szExeFile.len());
-            let executable = String::from_utf16_lossy(&entry.szExeFile[..length]);
+        applications.entry(pid).or_insert(application);
 
-            if is_user_app(&executable) {
-                processes.push(RunningProcess {
-                    pid: entry.th32ProcessID,
-                    executable,
-                });
-            }
-
-            if Process32NextW(snapshot, &mut entry).is_err() {
-                break;
-            }
-        }
-        let _ = CloseHandle(snapshot);
-        processes
+        BOOL(1)
     }
 }
 
-fn extract_process_info(title: &String, process_id: u32) -> Result<Process, ()> {
+fn list_applications() -> HashMap<u32, Application> {
+    let mut applications: HashMap<u32, Application> = HashMap::new();
+    let applications_ptr = &mut applications as *mut HashMap<u32, Application>;
+    unsafe {
+        if let Err(error) =
+            EnumWindows(Some(collect_application), LPARAM(applications_ptr as isize))
+        {
+            println!("EnumWindows failed: {}", error);
+        }
+    }
+
+    applications
+}
+
+fn get_executable_path(process_id: u32) -> Result<String, ()> {
     // get the process handle
     unsafe {
         let process_handle = match OpenProcess(PROCESS_QUERY_INFORMATION, false, process_id) {
@@ -107,31 +184,20 @@ fn extract_process_info(title: &String, process_id: u32) -> Result<Process, ()> 
             &mut length,
         ) {
             println!("Failed to get process path: {}", error);
+            let _ = CloseHandle(process_handle);
             return Err(());
         }
 
         let name = String::from_utf16_lossy(&process_name[..length as usize]);
+        let _ = CloseHandle(process_handle);
 
-        Ok(Process {
-            title: title.to_string(),
-            executable: name,
-            pid: process_id,
-        })
+        Ok(name)
     }
 }
 fn main() {
     let mut previous_process = String::new();
-    let mut total_process = 0;
-
-    println!("********* ************** ********** ");
-    println!();
-    for process in list_running_processes() {
-        total_process += 1;
-        println!("PID: {} | Process: {}", process.pid, process.executable);
-    }
-    println!();
-    println!("Total processes: {}", total_process);
-    println!("********* ************** ********** ");
+    let applications = list_applications();
+    println!("{applications:#?}");
 
     loop {
         unsafe {
@@ -145,21 +211,28 @@ fn main() {
             let length = GetWindowTextW(hwnd, &mut buffer);
             let title = String::from_utf16_lossy(&buffer[..length as usize]);
 
-            let process = match extract_process_info(&title, process_id) {
-                Ok(proc) => proc,
+            let executable = match get_executable_path(process_id) {
+                Ok(path) => path,
                 Err(_) => {
                     thread::sleep(Duration::from_secs(5));
                     continue;
                 }
             };
-            if process.executable != previous_process {
+
+            let application = Application {
+                title,
+                executable,
+                pid: process_id,
+            };
+
+            if application.executable != previous_process {
                 println!("-------------------------");
-                println!("Window: {}", process.title);
-                println!("PID: {}", process.pid);
-                println!("Process: {}", process.executable);
+                println!("Window: {}", application.title);
+                println!("PID: {}", application.pid);
+                println!("Process: {}", application.executable);
                 println!("-------------------------");
 
-                previous_process = process.executable.clone();
+                previous_process = application.executable.clone();
             }
 
             if thread_id == 0 {
