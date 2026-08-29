@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::fs::File;
-use std::path::Path;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -30,15 +30,44 @@ struct Application {
 struct AppUsage {
     total_time: Duration,
 }
+
+fn application_data_dir() -> PathBuf {
+    let directory = dirs::data_local_dir()
+        .expect("Couldn't find the local application data directory")
+        .join("app-usage-tracker");
+
+    fs::create_dir_all(&directory).expect("Couldn't create the application data directory");
+
+    directory
+}
+
+fn usage_file_path() -> PathBuf {
+    application_data_dir().join("usage.json")
+}
+
+fn tracker_pid_path() -> PathBuf {
+    application_data_dir().join("tracker.pid")
+}
+
+fn migrate_legacy_usage_file() {
+    let new_path = usage_file_path();
+    let old_path = Path::new("usage.json");
+
+    if !new_path.exists() && old_path.exists() {
+        fs::copy(old_path, &new_path).expect("Couldn't migrate usage.json");
+        println!("Migrated usage data to {}", new_path.display());
+    }
+}
+
 // funcs
 fn read_usage() -> HashMap<String, Application> {
-    let file = File::open("usage.json").expect("Couldn't open usage.json");
+    let file = File::open(usage_file_path()).expect("Couldn't open usage.json");
 
     serde_json::from_reader(file).expect("Couldn't read usage.json")
 }
 
 fn append_to_the_file(applications: &HashMap<String, Application>) {
-    let file = File::open("usage.json").expect("Couldn't open usage.json");
+    let file = File::open(usage_file_path()).expect("Couldn't open usage.json");
     let mut saved_applications: HashMap<String, Application> =
         serde_json::from_reader(file).expect("Couldn't read applications from usage.json");
 
@@ -59,7 +88,7 @@ fn append_to_the_file(applications: &HashMap<String, Application>) {
 
 fn overwrite_existing(app: &HashMap<String, Application>, create_new: bool) {
     if create_new {
-        let file = File::create("usage.json").expect("Couldn't open usage.sjon for writing");
+        let file = File::create(usage_file_path()).expect("Couldn't open usage.sjon for writing");
         serde_json::to_writer_pretty(file, &app).expect("Couldn't write usage.json");
         return;
     }
@@ -67,7 +96,7 @@ fn overwrite_existing(app: &HashMap<String, Application>, create_new: bool) {
     let file = match File::options()
         .write(true)
         .create_new(true)
-        .open("usage.json")
+        .open(usage_file_path())
     {
         Ok(file) => file,
 
@@ -280,7 +309,7 @@ fn bismillah() {
         .arg("spawn-child")
         .spawn()
         .expect("Couldn't start the tracker");
-    let _ = std::fs::write("tracker.pid", child.id().to_string());
+    let _ = fs::write(tracker_pid_path(), child.id().to_string());
     println!("Tracker started with PID:{}", child.id())
 }
 
@@ -297,7 +326,8 @@ fn run_tracker() {
     }
 }
 fn kill_tracker() {
-    let pid = std::fs::read_to_string("tracker.pid").expect("Tracker no running");
+    let pid_path = tracker_pid_path();
+    let pid = fs::read_to_string(&pid_path).expect("Tracker no running");
     let pid: u32 = pid.parse().expect("Invalid PID");
 
     unsafe {
@@ -306,7 +336,7 @@ fn kill_tracker() {
         TerminateProcess(handle, 0).expect("Failed to terminate");
         let _ = CloseHandle(handle);
     }
-    let _ = std::fs::remove_file("tracker.pid").expect("tracker.pid file dont exists! :(");
+    let _ = fs::remove_file(pid_path).expect("tracker.pid file dont exists! :(");
 }
 fn create_bar(current: Duration, maximum: Duration) -> String {
     if maximum.is_zero() {
@@ -343,6 +373,8 @@ fn show_usage() {
 }
 
 fn main() {
+    migrate_legacy_usage_file();
+
     let command = std::env::args().nth(1);
     match command.as_deref() {
         Some("run") => bismillah(),
