@@ -2,16 +2,18 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::path::Path;
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, QueryFullProcessImageNameW,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
 };
 use windows::core::PWSTR;
 
@@ -29,6 +31,12 @@ struct AppUsage {
     total_time: Duration,
 }
 // funcs
+fn read_usage() -> HashMap<String, Application> {
+    let file = File::open("usage.json").expect("Couldn't open usage.json");
+
+    serde_json::from_reader(file).expect("Couldn't read usage.json")
+}
+
 fn append_to_the_file(applications: &HashMap<String, Application>) {
     let file = File::open("usage.json").expect("Couldn't open usage.json");
     let mut saved_applications: HashMap<String, Application> =
@@ -233,20 +241,6 @@ fn list_applications() -> HashMap<String, Application> {
     applications
 }
 
-fn get_active_app() {
-    unsafe {
-        // get the process
-        let hwnd = GetForegroundWindow();
-        let mut process_id = 0;
-        let thread_id = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-
-        // extract the window name
-        let mut buffer = [0u16; 512];
-        let length = GetWindowTextW(hwnd, &mut buffer);
-        let title = String::from_utf16_lossy(&buffer[..length as usize]);
-    }
-}
-
 fn get_executable_path(process_id: u32) -> Result<String, ()> {
     // get the process handle
     unsafe {
@@ -278,7 +272,19 @@ fn get_executable_path(process_id: u32) -> Result<String, ()> {
         Ok(name)
     }
 }
-fn main() {
+
+fn bismillah() {
+    let executable = std::env::current_exe().expect("Couldn't ifnd the tracker executable");
+
+    let child = Command::new(executable)
+        .arg("spawn-child")
+        .spawn()
+        .expect("Couldn't start the tracker");
+    let _ = std::fs::write("tracker.pid", child.id().to_string());
+    println!("Tracker started with PID:{}", child.id())
+}
+
+fn run_tracker() {
     let applications = list_applications();
     println!("{applications:#?}");
     overwrite_existing(&applications, false);
@@ -288,5 +294,66 @@ fn main() {
         append_to_the_file(&applications);
 
         thread::sleep(Duration::from_secs(30));
+    }
+}
+fn kill_tracker() {
+    let pid = std::fs::read_to_string("tracker.pid").expect("Tracker no running");
+    let pid: u32 = pid.parse().expect("Invalid PID");
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, false, pid).expect("Cannot open tracker");
+
+        TerminateProcess(handle, 0).expect("Failed to terminate");
+        let _ = CloseHandle(handle);
+    }
+    let _ = std::fs::remove_file("tracker.pid").expect("tracker.pid file dont exists! :(");
+}
+fn create_bar(current: Duration, maximum: Duration) -> String {
+    if maximum.is_zero() {
+        return String::new();
+    }
+
+    let bar_length = (current.as_secs() * 30 / maximum.as_secs()) as usize;
+
+    "█".repeat(bar_length)
+}
+
+fn main() {
+    let command = std::env::args().nth(1);
+    match command.as_deref() {
+        Some("run") => bismillah(),
+        Some("spawn-child") => run_tracker(),
+        Some("kill") => {
+            kill_tracker();
+        }
+
+        Some("usage") => {
+            let applications_by_executable = read_usage();
+
+            let mut applications: Vec<Application> =
+                applications_by_executable.values().cloned().collect();
+            applications.sort_by(|a, b| b.usage.total_time.cmp(&a.usage.total_time));
+            let Some(first_application) = applications.first() else {
+                println!("No applications found.");
+                return;
+            };
+            let maximum_usage = first_application.usage.total_time;
+
+            for application in &applications {
+                let bar = create_bar(application.usage.total_time, maximum_usage);
+
+                let total_seconds = application.usage.total_time.as_secs();
+                let hour = total_seconds / 3600;
+                let minutes = (total_seconds % 3600) / 60;
+
+                println!(
+                    "{:<24} | {:<30} {:02}h {:02}m\n",
+                    application.name, bar, hour, minutes
+                );
+            }
+        }
+        _ => {
+            println!("Usage: usage-tracker <start|end|usage>");
+        }
     }
 }
