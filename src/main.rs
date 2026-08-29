@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::fs::File;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, QueryFullProcessImageNameW,
@@ -12,29 +15,73 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PWSTR;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Application {
     title: String,
+    name: String,
     executable: String,
     pid: u32,
-}
-struct AppUsage {
-    executable: String,
-    total_time: Duration,
+    usage: AppUsage,
 }
 
-fn update_usage(tracker: &mut HashMap<String, AppUsage>, app: &Application) {
-    if let Some(usage) = tracker.get_mut(&app.executable) {
-        usage.total_time += Duration::from_secs(1);
-    } else {
-        tracker.insert(
-            app.executable.clone(),
-            AppUsage {
-                executable: app.executable.clone(),
-                total_time: Duration::from_secs(1),
-            },
-        );
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AppUsage {
+    total_time: Duration,
+}
+// funcs
+fn append_to_the_file(applications: &HashMap<String, Application>) {
+    let file = File::open("usage.json").expect("Couldn't open usage.json");
+    let mut saved_applications: HashMap<String, Application> =
+        serde_json::from_reader(file).expect("Couldn't read applications from usage.json");
+
+    for application in applications.values() {
+        match saved_applications.entry(application.executable.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(application.clone());
+            }
+
+            Entry::Occupied(mut entry) => {
+                let saved_application = entry.get_mut();
+                saved_application.usage.total_time += Duration::from_secs(30);
+            }
+        }
     }
+    overwrite_existing(&saved_applications, true);
+}
+
+fn overwrite_existing(app: &HashMap<String, Application>, create_new: bool) {
+    if create_new {
+        let file = File::create("usage.json").expect("Couldn't open usage.sjon for writing");
+        serde_json::to_writer_pretty(file, &app).expect("Couldn't write usage.json");
+        return;
+    }
+
+    let file = match File::options()
+        .write(true)
+        .create_new(true)
+        .open("usage.json")
+    {
+        Ok(file) => file,
+
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            println!("usage.json already exists; leaving it unchanged");
+            return;
+        }
+        Err(error) => {
+            panic!("Couldnt create usage.json:{error}")
+        }
+    };
+
+    let res = serde_json::to_writer_pretty(file, &app);
+    println!("output: {:?}", res);
+}
+
+fn extract_name_from_path(executable: &String) -> String {
+    let app_name: String = Path::new(&executable)
+        .file_name()
+        .map(|program_name| program_name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    app_name
 }
 
 fn is_windows_system_path(executable: &str) -> bool {
@@ -125,7 +172,8 @@ fn is_valid_application(app: &Application) -> bool {
 
 unsafe extern "system" fn collect_application(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
-        let applications_ptr = lparam.0 as *mut HashMap<u32, Application>;
+        let applications_ptr = lparam.0 as *mut HashMap<String, Application>;
+
         let applications = &mut *applications_ptr;
 
         if !IsWindowVisible(hwnd).as_bool() {
@@ -152,24 +200,28 @@ unsafe extern "system" fn collect_application(hwnd: HWND, lparam: LPARAM) -> BOO
         };
 
         let application = Application {
-            title,
-            executable,
+            title: title.clone(),
+            name: extract_name_from_path(&executable),
+            executable: executable.clone(),
             pid,
+            usage: AppUsage {
+                total_time: Duration::ZERO,
+            },
         };
 
         if !is_valid_application(&application) {
             return BOOL(1);
         }
 
-        applications.entry(pid).or_insert(application);
+        applications.entry(executable).or_insert(application);
 
         BOOL(1)
     }
 }
 
-fn list_applications() -> HashMap<u32, Application> {
-    let mut applications: HashMap<u32, Application> = HashMap::new();
-    let applications_ptr = &mut applications as *mut HashMap<u32, Application>;
+fn list_applications() -> HashMap<String, Application> {
+    let mut applications: HashMap<String, Application> = HashMap::new();
+    let applications_ptr = &mut applications as *mut HashMap<String, Application>; //borrwo the applications mutably and get the raw pointer to the first element
     unsafe {
         if let Err(error) =
             EnumWindows(Some(collect_application), LPARAM(applications_ptr as isize))
@@ -179,6 +231,20 @@ fn list_applications() -> HashMap<u32, Application> {
     }
 
     applications
+}
+
+fn get_active_app() {
+    unsafe {
+        // get the process
+        let hwnd = GetForegroundWindow();
+        let mut process_id = 0;
+        let thread_id = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+
+        // extract the window name
+        let mut buffer = [0u16; 512];
+        let length = GetWindowTextW(hwnd, &mut buffer);
+        let title = String::from_utf16_lossy(&buffer[..length as usize]);
+    }
 }
 
 fn get_executable_path(process_id: u32) -> Result<String, ()> {
@@ -213,61 +279,14 @@ fn get_executable_path(process_id: u32) -> Result<String, ()> {
     }
 }
 fn main() {
-    let mut previous_process = String::new();
     let applications = list_applications();
     println!("{applications:#?}");
+    overwrite_existing(&applications, false);
 
-    let mut usage_tracker: HashMap<String, AppUsage> = HashMap::new();
     loop {
-        unsafe {
-            // get the process
-            let hwnd = GetForegroundWindow();
-            let mut process_id = 0;
-            let thread_id = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        let applications = list_applications();
+        append_to_the_file(&applications);
 
-            // extract the window name
-            let mut buffer = [0u16; 512];
-            let length = GetWindowTextW(hwnd, &mut buffer);
-            let title = String::from_utf16_lossy(&buffer[..length as usize]);
-
-            let executable = match get_executable_path(process_id) {
-                Ok(path) => path,
-                Err(_) => {
-                    thread::sleep(Duration::from_secs(5));
-                    continue;
-                }
-            };
-
-            let application = Application {
-                title,
-                executable,
-                pid: process_id,
-            };
-            if is_valid_application(&application) {
-                update_usage(&mut usage_tracker, &application);
-
-                if let Some(usage) = usage_tracker.get(&application.executable) {
-                    println!(
-                        "{}: {} seconds",
-                        usage.executable,
-                        usage.total_time.as_secs()
-                    );
-                }
-            }
-            if application.executable != previous_process {
-                println!("-------------------------");
-                println!("Window: {}", application.title);
-                println!("PID: {}", application.pid);
-                println!("Process: {}", application.executable);
-                println!("-------------------------");
-
-                previous_process = application.executable.clone();
-            }
-
-            if thread_id == 0 {
-                println!("Faile to get the process ID");
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
+        thread::sleep(Duration::from_secs(30));
     }
 }
