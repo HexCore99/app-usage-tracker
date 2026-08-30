@@ -5,7 +5,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{
@@ -13,8 +13,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Threading::{
     CreateMutexW, DETACHED_PROCESS, OpenMutexW, OpenProcess, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
-    SYNCHRONIZATION_SYNCHRONIZE, TerminateProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, SYNCHRONIZATION_SYNCHRONIZE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
@@ -54,6 +53,10 @@ fn tracker_pid_path() -> PathBuf {
     application_data_dir().join("tracker.pid")
 }
 
+fn stop_request_path() -> PathBuf {
+    application_data_dir().join("stop.request")
+}
+
 fn migrate_legacy_usage_file() {
     let new_path = usage_file_path();
     let old_path = Path::new("usage.json");
@@ -70,11 +73,10 @@ fn read_usage() -> HashMap<String, Application> {
     serde_json::from_reader(file).expect("Couldn't read usage.json")
 }
 
-fn append_to_the_file(applications: &HashMap<String, Application>) {
-    let file = File::open(usage_file_path()).expect("Couldn't open usage.json");
-    let mut saved_applications: HashMap<String, Application> =
-        serde_json::from_reader(file).expect("Couldn't read applications from usage.json");
-
+fn update_visible_applications(
+    saved_applications: &mut HashMap<String, Application>,
+    applications: &HashMap<String, Application>,
+) {
     for application in applications.values() {
         match saved_applications.entry(application.executable.clone()) {
             Entry::Vacant(entry) => {
@@ -83,20 +85,18 @@ fn append_to_the_file(applications: &HashMap<String, Application>) {
 
             Entry::Occupied(mut entry) => {
                 let saved_application = entry.get_mut();
-                saved_application.usage.total_time += Duration::from_secs(30);
+                saved_application.usage.total_time += Duration::from_secs(1);
             }
         }
     }
-    overwrite_existing(&saved_applications, true);
 }
 
-fn overwrite_existing(app: &HashMap<String, Application>, create_new: bool) {
-    if create_new {
-        let file = File::create(usage_file_path()).expect("Couldn't open usage.sjon for writing");
-        serde_json::to_writer_pretty(file, &app).expect("Couldn't write usage.json");
-        return;
-    }
+fn save_usage(applications: &HashMap<String, Application>) {
+    let file = File::create(usage_file_path()).expect("Couldn't open usage.json for writing");
+    serde_json::to_writer_pretty(file, applications).expect("Couldn't write usage.json");
+}
 
+fn create_usage_file_if_missing(applications: &HashMap<String, Application>) {
     let file = match File::options()
         .write(true)
         .create_new(true)
@@ -113,8 +113,7 @@ fn overwrite_existing(app: &HashMap<String, Application>, create_new: bool) {
         }
     };
 
-    let res = serde_json::to_writer_pretty(file, &app);
-    println!("output: {:?}", res);
+    serde_json::to_writer_pretty(file, applications).expect("Couldn't write usage.json");
 }
 
 fn extract_name_from_path(executable: &String) -> String {
@@ -291,7 +290,8 @@ fn list_applications() -> HashMap<String, Application> {
 fn get_executable_path(process_id: u32) -> Result<String, ()> {
     // get the process handle
     unsafe {
-        let process_handle = match OpenProcess(PROCESS_QUERY_INFORMATION, false, process_id) {
+        let process_handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+        {
             Ok(handle) => handle,
             Err(error) => {
                 println!("Failed to open process, {}", error);
@@ -355,32 +355,46 @@ fn run_tracker() {
     let Some(_tracker_mutex) = acquire_tracker_mutex() else {
         return;
     };
+
+    let _ = fs::remove_file(stop_request_path());
     fs::write(tracker_pid_path(), std::process::id().to_string())
         .expect("Couldn't write tracker.pid");
 
     let applications = list_applications();
     println!("{applications:#?}");
-    overwrite_existing(&applications, false);
+    create_usage_file_if_missing(&applications);
+
+    let mut saved_applications = read_usage();
+    let mut last_save = Instant::now();
 
     loop {
         let applications = list_applications();
-        append_to_the_file(&applications);
+        update_visible_applications(&mut saved_applications, &applications);
 
-        thread::sleep(Duration::from_secs(30));
+        if stop_request_path().exists() {
+            save_usage(&saved_applications);
+            let _ = fs::remove_file(stop_request_path());
+            let _ = fs::remove_file(tracker_pid_path());
+            println!("Tracker stopped and usage.json was saved.");
+            break;
+        }
+
+        if last_save.elapsed() >= Duration::from_secs(60) {
+            save_usage(&saved_applications);
+            last_save = Instant::now();
+        }
+
+        thread::sleep(Duration::from_secs(1));
     }
 }
 fn kill_tracker() {
-    let pid_path = tracker_pid_path();
-    let pid = fs::read_to_string(&pid_path).expect("App is not running");
-    let pid: u32 = pid.parse().expect("Invalid PID");
-
-    unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, false, pid).expect("Cannot open tracker");
-
-        TerminateProcess(handle, 0).expect("Failed to terminate");
-        let _ = CloseHandle(handle);
+    if !is_tracker_mutex_exists() {
+        println!("App is not running.");
+        return;
     }
-    let _ = fs::remove_file(pid_path).expect("tracker.pid file dont exists! :(");
+
+    fs::write(stop_request_path(), "stop").expect("Couldn't request tracker shutdown");
+    println!("Stop requested. The tracker will save and exit within about one second.");
 }
 fn create_bar(current: Duration, maximum: Duration) -> String {
     if maximum.is_zero() {
