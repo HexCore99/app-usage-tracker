@@ -1,21 +1,25 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::{self, File};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM};
+use windows::Win32::Foundation::{
+    BOOL, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, TerminateProcess,
+    CreateMutexW, DETACHED_PROCESS, OpenMutexW, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
+    SYNCHRONIZATION_SYNCHRONIZE, TerminateProcess,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
 };
-use windows::core::PWSTR;
+use windows::core::{HSTRING, PWSTR};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Application {
@@ -31,6 +35,7 @@ struct AppUsage {
     total_time: Duration,
 }
 
+// funcs
 fn application_data_dir() -> PathBuf {
     let directory = dirs::data_local_dir()
         .expect("Couldn't find the local application data directory")
@@ -59,7 +64,6 @@ fn migrate_legacy_usage_file() {
     }
 }
 
-// funcs
 fn read_usage() -> HashMap<String, Application> {
     let file = File::open(usage_file_path()).expect("Couldn't open usage.json");
 
@@ -119,6 +123,20 @@ fn extract_name_from_path(executable: &String) -> String {
         .map(|program_name| program_name.to_string_lossy().into_owned())
         .unwrap_or_default();
     app_name
+}
+
+fn acquire_tracker_mutex() -> Option<HANDLE> {
+    let name = HSTRING::from("Local\\AppUsageTrackerMutex");
+
+    unsafe {
+        let mutex = CreateMutexW(None, false, &name).expect("Couldn't create tracker mutex");
+
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(mutex);
+            return None;
+        }
+        Some(mutex)
+    }
 }
 
 fn is_windows_system_path(executable: &str) -> bool {
@@ -276,7 +294,7 @@ fn get_executable_path(process_id: u32) -> Result<String, ()> {
         let process_handle = match OpenProcess(PROCESS_QUERY_INFORMATION, false, process_id) {
             Ok(handle) => handle,
             Err(error) => {
-                println!("Faile to open process, {}", error);
+                println!("Failed to open process, {}", error);
                 return Err(());
             }
         };
@@ -302,18 +320,44 @@ fn get_executable_path(process_id: u32) -> Result<String, ()> {
     }
 }
 
+fn is_tracker_mutex_exists() -> bool {
+    let name = HSTRING::from("Local\\AppUsageTrackerMutex");
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &name) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 fn bismillah() {
+    if is_tracker_mutex_exists() {
+        println!("App is already Running!");
+        return;
+    }
+
     let executable = std::env::current_exe().expect("Couldn't ifnd the tracker executable");
 
-    let child = Command::new(executable)
+    let _child = Command::new(executable)
         .arg("spawn-child")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS.0)
         .spawn()
         .expect("Couldn't start the tracker");
-    let _ = fs::write(tracker_pid_path(), child.id().to_string());
-    println!("Tracker started with PID:{}", child.id())
 }
 
 fn run_tracker() {
+    let Some(_tracker_mutex) = acquire_tracker_mutex() else {
+        return;
+    };
+    fs::write(tracker_pid_path(), std::process::id().to_string())
+        .expect("Couldn't write tracker.pid");
+
     let applications = list_applications();
     println!("{applications:#?}");
     overwrite_existing(&applications, false);
@@ -327,7 +371,7 @@ fn run_tracker() {
 }
 fn kill_tracker() {
     let pid_path = tracker_pid_path();
-    let pid = fs::read_to_string(&pid_path).expect("Tracker no running");
+    let pid = fs::read_to_string(&pid_path).expect("App is not running");
     let pid: u32 = pid.parse().expect("Invalid PID");
 
     unsafe {
@@ -379,12 +423,8 @@ fn main() {
     match command.as_deref() {
         Some("run") => bismillah(),
         Some("spawn-child") => run_tracker(),
-        Some("kill") => {
-            kill_tracker();
-        }
-        Some("usage") => {
-            show_usage();
-        }
+        Some("kill") => kill_tracker(),
+        Some("usage") => show_usage(),
         _ => {
             println!("Usage: usage-tracker <start|end|usage>");
         }
