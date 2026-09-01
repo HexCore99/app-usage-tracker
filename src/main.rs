@@ -514,6 +514,19 @@ fn main() {
         Some("usage") => show_usage(),
         Some("enable-autostart") => add_to_startup(),
         Some("disable-autostart") => remove_from_startup(),
+        Some("-h")|Some("--help")=>{
+            println!(
+                   "Usage: usage-tracker <command>
+           
+           Commands:
+             run               Start the usage tracker
+             kill              Stop the running tracker
+             usage             Show saved usage
+             enable-autostart  Start automatically with Windows
+             disable-autostart Disable Windows auto-start
+             -h, --help        Show this help message"
+               );
+        }
         _ => {
             println!("Usage: usage-tracker <start|end|usage>");
         }
