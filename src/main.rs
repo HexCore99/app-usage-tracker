@@ -20,10 +20,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PWSTR};
 
+use std::ffi::c_void;
+use windows::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+};
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Application {
     title: String,
     name: String,
+    #[serde(default)]
+    display_name: String,
     executable: String,
     pid: u32,
     usage: AppUsage,
@@ -35,6 +42,70 @@ struct AppUsage {
 }
 
 // funcs
+
+fn get_product_name(executable: &str) -> Option<String> {
+    unsafe {
+        let path = HSTRING::from(executable);
+        let mut handle = 0u32;
+        let size = GetFileVersionInfoSizeW(&path, Some(&mut handle));
+        if size == 0 {
+            return None;
+        }
+
+        let mut buffer = vec![0u8; size as usize];
+        if GetFileVersionInfoW(&path, 0, size, buffer.as_mut_ptr() as *mut c_void).is_err() {
+            return None;
+        }
+
+        // Find which language/codepage the file's strings are stored under.
+        let mut translation_ptr: *mut c_void = std::ptr::null_mut();
+        let mut translation_len = 0u32;
+        if !VerQueryValueW(
+            buffer.as_ptr() as *const c_void,
+            &HSTRING::from("\\VarFileInfo\\Translation"),
+            &mut translation_ptr,
+            &mut translation_len,
+        )
+        .as_bool()
+            || translation_ptr.is_null()
+        {
+            return None;
+        }
+
+        let langs = std::slice::from_raw_parts(
+            translation_ptr as *const (u16, u16),
+            translation_len as usize / 4,
+        );
+        let (lang, codepage) = *langs.first()?;
+
+        for field in ["ProductName", "FileDescription"] {
+            let query = format!("\\StringFileInfo\\{lang:04x}{codepage:04x}\\{field}");
+            let mut value_ptr: *mut c_void = std::ptr::null_mut();
+            let mut value_len = 0u32;
+
+            if VerQueryValueW(
+                buffer.as_ptr() as *const c_void,
+                &HSTRING::from(query.as_str()),
+                &mut value_ptr,
+                &mut value_len,
+            )
+            .as_bool()
+                && !value_ptr.is_null()
+                && value_len > 0
+            {
+                let wide =
+                    std::slice::from_raw_parts(value_ptr as *const u16, value_len as usize - 1);
+                let name = String::from_utf16_lossy(wide).trim().to_string();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+
+        None
+    }
+}
+
 fn application_data_dir() -> PathBuf {
     let directory = dirs::data_local_dir()
         .expect("Couldn't find the local application data directory")
@@ -86,6 +157,10 @@ fn update_visible_applications(
             Entry::Occupied(mut entry) => {
                 let saved_application = entry.get_mut();
                 saved_application.usage.total_time += Duration::from_secs(1);
+
+                if saved_application.display_name.is_empty() {
+                    saved_application.display_name = application.display_name.clone();
+                }
             }
         }
     }
@@ -253,9 +328,13 @@ unsafe extern "system" fn collect_application(hwnd: HWND, lparam: LPARAM) -> BOO
             Err(_) => return BOOL(1),
         };
 
+        let display_name =
+            get_product_name(&executable).unwrap_or_else(|| extract_name_from_path(&executable));
+
         let application = Application {
             title: title.clone(),
             name: extract_name_from_path(&executable),
+            display_name,
             executable: executable.clone(),
             pid,
             usage: AppUsage {
@@ -424,8 +503,8 @@ fn show_usage() {
         let minutes = (total_seconds % 3600) / 60;
 
         println!(
-            "{:<24} | {:<30} {:02}h {:02}m\n",
-            application.name, bar, hour, minutes
+            "{:<40} | {:<30} {:02}h {:02}m\n",
+            application.display_name, bar, hour, minutes
         );
     }
 }
