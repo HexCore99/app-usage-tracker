@@ -2,6 +2,13 @@
 name = "usage-tracker"
 version = "0.1.0"
 edition = "2024"
+authors = ["HExEN"]
+description = "A lightweight Windows application usage tracker."
+homepage = "https://github.com/HexCore99/usage-tracker"
+repository = "https://github.com/HexCore99/usage-tracker"
+
+[package.metadata.wix]
+eula = false
 
 [dependencies]
 windows = { version = "0.58", features = [

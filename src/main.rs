@@ -22,6 +22,10 @@ fn main() {
         Some("usage") => show_usage(),
         Some("enable-autostart") => add_to_startup(),
         Some("disable-autostart") => remove_from_startup(),
+        Some("-v") | Some("--version") => {
+            println!("usage-tracker {}", env!("CARGO_PKG_VERSION"));
+        }
+        None => bismillah(),
         Some("-h") | Some("--help") => {
             println!(
                 "Usage: usage-tracker <command>
