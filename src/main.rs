@@ -1,3 +1,5 @@
+mod startup;
+use startup::{add_to_startup, is_startup_registered, remove_from_startup};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::{self, File};
@@ -126,16 +128,6 @@ fn tracker_pid_path() -> PathBuf {
 
 fn stop_request_path() -> PathBuf {
     application_data_dir().join("stop.request")
-}
-
-fn migrate_legacy_usage_file() {
-    let new_path = usage_file_path();
-    let old_path = Path::new("usage.json");
-
-    if !new_path.exists() && old_path.exists() {
-        fs::copy(old_path, &new_path).expect("Couldn't migrate usage.json");
-        println!("Migrated usage data to {}", new_path.display());
-    }
 }
 
 fn read_usage() -> HashMap<String, Application> {
@@ -510,7 +502,9 @@ fn show_usage() {
 }
 
 fn main() {
-    migrate_legacy_usage_file();
+    if !is_startup_registered() {
+        add_to_startup();
+    }
 
     let command = std::env::args().nth(1);
     match command.as_deref() {
@@ -518,6 +512,8 @@ fn main() {
         Some("spawn-child") => run_tracker(),
         Some("kill") => kill_tracker(),
         Some("usage") => show_usage(),
+        Some("enable-autostart") => add_to_startup(),
+        Some("disable-autostart") => remove_from_startup(),
         _ => {
             println!("Usage: usage-tracker <start|end|usage>");
         }
