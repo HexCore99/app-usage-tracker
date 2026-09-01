@@ -11,6 +11,7 @@ windows = { version = "0.58", features = [
   "Win32_System_ProcessStatus",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_Security",
+  "Win32_Storage_FileSystem",
 ] }
 sysinfo = "0.30"
 serde = { version = "1", features = ["derive"] }
