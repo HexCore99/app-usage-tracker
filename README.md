@@ -35,13 +35,7 @@ Usage Tracker runs quietly in the background, records how long desktop applicati
 ### MSI installer (recommended)
 
 1. Download [`usage-tracker-0.1.0-x86_64.msi`](https://github.com/HexCore99/app-usage-tracker/releases/download/v0.1.0/usage-tracker-0.1.0-x86_64.msi).
-2. Run the installer and keep the **PATH Environment Variable** feature enabled.
-3. Open a new PowerShell or terminal window so it receives the updated `PATH`.
-4. Confirm the installation:
-
-```powershell
-usage-tracker --version
-```
+2. Run the installer.
 
 ### Build from source
 
