@@ -40,7 +40,7 @@ Commands:
             );
         }
         _ => {
-            println!("Usage: usage-tracker <start|end|usage>");
+            println!("Usage: usage-tracker <run|kill|usage>");
         }
     }
 }
